@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<title>Scrubbing con vocoder de fase</title>
+<style>
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    max-width: 720px;
+    margin: 40px auto;
+    padding: 0 20px;
+    color: #222;
+    background: #fafafa;
+  }
+  h1 { font-size: 20px; font-weight: 600; }
+  p.sub { color: #666; font-size: 14px; margin-top: -8px; }
+  .panel {
+    background: #fff;
+    border: 1px solid #ddd;
+    border-radius: 10px;
+    padding: 16px 20px;
+    margin-bottom: 16px;
+  }
+  .row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+  button {
+    padding: 8px 14px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    background: #fff;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  button:hover { background: #f0f0f0; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  canvas#wave {
+    width: 100%;
+    height: 140px;
+    background: #f1f1f1;
+    border-radius: 8px;
+    cursor: grab;
+    display: block;
+  }
+  .wavewrap { position: relative; }
+  #playhead {
+    position: absolute;
+    top: 0; bottom: 0; width: 2px;
+    background: #d85a30;
+    left: 0;
+    display: none;
+    pointer-events: none;
+  }
+  .meta { font-size: 13px; color: #666; display: flex; justify-content: space-between; margin-top: 6px; }
+  label { font-size: 13px; color: #444; }
+  input[type=range] { vertical-align: middle; }
+  code { background: #eee; padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+
+<h1>Scrubbing con vocoder de fase (FFT real)</h1>
+<p class="sub">Comparación más fiel al modelo sinusoidal de Wessel &amp; Wright: en vez de reproducir granos crudos de audio, reconstruye el sonido a partir de su espectro (magnitud + fase) en cada instante, lo que permite "congelar" el tiempo con una textura sostenida en vez de un click repetido.</p>
+
+<div class="panel">
+  <div class="row">
+    <input type="file" id="fileInput" accept="audio/*" />
+    <span id="status" style="font-size:13px; color:#666;">Carga un archivo de audio corto (1-5 s funciona mejor)</span>
+  </div>
+  <div class="row">
+    <button id="startBtn" disabled>Iniciar vocoder</button>
+    <button id="stopBtn" disabled>Silenciar</button>
+    <label>Inercia del cursor
+      <input type="range" id="inertiaSlider" min="5" max="90" value="35" />
+    </label>
+    <span id="inertiaOut" style="font-size:13px;">0.35</span>
+  </div>
+
+  <div class="wavewrap">
+    <canvas id="wave"></canvas>
+    <div id="playhead"></div>
+  </div>
+  <div class="meta">
+    <span id="timeOut">--</span>
+    <span id="durOut">--</span>
+  </div>
+</div>
+
+<p class="sub">
+  Arrastra el mouse sobre la onda para mover la posición de lectura. Si sueltas el mouse,
+  el vocoder se queda congelado en esa posición pero sigue sonando: la fase del espectro
+  sigue evolucionando con su frecuencia instantánea, así que en vez de repetir un loop
+  con click (como en la versión granular) obtienes un sostenido tipo "drone" con el timbre
+  original. Esto es justo el tipo de comportamiento continuo y sin discontinuidades que
+  Wessel &amp; Wright buscaban al tratar los gestos como señales continuas en vez de eventos
+  discretos.
+</p>
+
+<script>
+(function () {
+  // ---------- FFT radix-2 iterativa (Cooley-Tukey), in-place sobre arrays paralelos re/im ----------
+  // invert=false -> transformada directa (sin normalizar)
+  // invert=true  -> transformada inversa (normaliza dividiendo por N)
+  function fft(re, im, invert) {
+    const n = re.length;
+    for (let i = 1, j = 0; i < n; i++) {
+      let bit = n >> 1;
+      for (; j & bit; bit >>= 1) j ^= bit;
+      j ^= bit;
+      if (i < j) {
+        let t = re[i]; re[i] = re[j]; re[j] = t;
+        t = im[i]; im[i] = im[j]; im[j] = t;
+      }
+    }
+    for (let len = 2; len <= n; len <<= 1) {
+      const ang = (invert ? 1 : -1) * 2 * Math.PI / len;
+      const wRe = Math.cos(ang), wIm = Math.sin(ang);
+      for (let i = 0; i < n; i += len) {
+        let curRe = 1, curIm = 0;
+        const half = len >> 1;
+        for (let j = 0; j < half; j++) {
+          const aRe = re[i + j], aIm = im[i + j];
+          const bRe = re[i + j + half] * curRe - im[i + j + half] * curIm;
+          const bIm = re[i + j + half] * curIm + im[i + j + half] * curRe;
+          re[i + j] = aRe + bRe; im[i + j] = aIm + bIm;
+          re[i + j + half] = aRe - bRe; im[i + j + half] = aIm - bIm;
+          const nRe = curRe * wRe - curIm * wIm;
+          const nIm = curRe * wIm + curIm * wRe;
+          curRe = nRe; curIm = nIm;
+        }
+      }
+    }
+    if (invert) {
+      for (let i = 0; i < n; i++) { re[i] /= n; im[i] /= n; }
+    }
+  }
+
+  // Ventana de Hann "periódica" (denominador N, no N-1): esta forma es la que
+  // garantiza overlap-add constante (COLA) en hops de N/4, N/2, etc.
+  function hannPeriodic(N) {
+    const w = new Float32Array(N);
+    for (let n = 0; n < N; n++) w[n] = 0.5 - 0.5 * Math.cos((2 * Math.PI * n) / N);
+    return w;
+  }
+
+  // ---------- Parámetros del análisis ----------
+  const N = 1024;        // tamaño de ventana / FFT
+  const Ha = 256;        // hop de análisis y de síntesis (75% de overlap)
+  const win = hannPeriodic(N);
+
+  let audioCtx = null;
+  let audioBuffer = null;
+  let frames = [];       // frames[f] = { mag: Float32Array(N), phase: Float32Array(N) }
+  let instFreq = [];     // instFreq[f] = Float32Array(N), avance de fase esperado entre frame f y f+1
+  let numFrames = 0;
+
+  let scriptNode = null;
+  let outAccum = new Float32Array(N);   // acumulador de overlap-add (muestras)
+  let normAccum = new Float32Array(N);  // acumulador de overlap-add (energía de ventana, para normalizar)
+  let outPhase = new Float32Array(N);   // fase de síntesis acumulada por bin
+  let currentFramePos = 0;
+  let targetRatio = 0;
+  let inertia = 0.35;
+
+  const fileInput = document.getElementById('fileInput');
+  const status = document.getElementById('status');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const inertiaSlider = document.getElementById('inertiaSlider');
+  const inertiaOut = document.getElementById('inertiaOut');
+  const canvas = document.getElementById('wave');
+  const playhead = document.getElementById('playhead');
+  const timeOut = document.getElementById('timeOut');
+  const durOut = document.getElementById('durOut');
+
+  inertiaSlider.addEventListener('input', () => {
+    inertia = parseInt(inertiaSlider.value, 10) / 100;
+    inertiaOut.textContent = inertia.toFixed(2);
+  });
+
+  function ensureCtx() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    return audioCtx;
+  }
+
+  function drawWaveform(buffer) {
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    const data = buffer.getChannelData(0);
+    const w = rect.width, h = rect.height;
+    const step = Math.ceil(data.length / w) || 1;
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = '#999';
+    const mid = h / 2;
+    for (let x = 0; x < w; x++) {
+      let min = 1, max = -1;
+      const start = x * step;
+      for (let i = 0; i < step; i++) {
+        const idx = start + i;
+        if (idx >= data.length) break;
+        const v = data[idx];
+        if (v < min) min = v;
+        if (v > max) max = v;
+      }
+      const y1 = mid + min * mid * 0.9;
+      const y2 = mid + max * mid * 0.9;
+      ctx.fillRect(x, y1, 1, Math.max(1, y2 - y1));
+    }
+  }
+
+  // ---------- Análisis offline: STFT completo + frecuencia instantánea ----------
+  function analyze(buffer) {
+    const data = buffer.getChannelData(0);
+    numFrames = Math.max(2, Math.floor((data.length - N) / Ha) + 1);
+    frames = [];
+    for (let f = 0; f < numFrames; f++) {
+      const start = f * Ha;
+      const re = new Float32Array(N);
+      const im = new Float32Array(N);
+      for (let n = 0; n < N; n++) {
+        const s = (start + n < data.length) ? data[start + n] : 0;
+        re[n] = s * win[n];
+      }
+      fft(re, im, false);
+      const mag = new Float32Array(N);
+      const phase = new Float32Array(N);
+      for (let k = 0; k < N; k++) {
+        mag[k] = Math.sqrt(re[k] * re[k] + im[k] * im[k]);
+        phase[k] = Math.atan2(im[k], re[k]);
+      }
+      frames.push({ mag, phase });
+    }
+
+    // Frecuencia instantánea por bin entre frames consecutivos.
+    // Esta es la clave del vocoder de fase: en vez de copiar la fase original,
+    // estimamos cuánto "debería" avanzar la fase de cada bin para ser
+    // consistente con la frecuencia real detectada, y esa frecuencia es la
+    // que usamos en la síntesis sin importar a qué velocidad te muevas.
+    instFreq = [];
+    for (let f = 0; f < numFrames - 1; f++) {
+      const arr = new Float32Array(N);
+      const p0 = frames[f].phase, p1 = frames[f + 1].phase;
+      for (let k = 0; k < N; k++) {
+        const expected = (2 * Math.PI * k * Ha) / N;
+        let delta = (p1[k] - p0[k]) - expected;
+        delta = delta - 2 * Math.PI * Math.round(delta / (2 * Math.PI)); // envolver a [-pi, pi]
+        arr[k] = expected + delta;
+      }
+      instFreq.push(arr);
+    }
+  }
+
+  // ---------- Un "hop" de síntesis: reconstruye N muestras a partir del espectro ----------
+  function synthesizeHop() {
+    const frameIdx = Math.min(Math.max(Math.round(currentFramePos), 0), numFrames - 2);
+    const mag = frames[frameIdx].mag;
+    const adv = instFreq[frameIdx];
+    const re = new Float32Array(N);
+    const im = new Float32Array(N);
+    for (let k = 0; k < N; k++) {
+      outPhase[k] += adv[k];
+      re[k] = mag[k] * Math.cos(outPhase[k]);
+      im[k] = mag[k] * Math.sin(outPhase[k]);
+    }
+    fft(re, im, true); // IFFT
+
+    for (let n = 0; n < N; n++) {
+      outAccum[n] += re[n] * win[n];
+      normAccum[n] += win[n] * win[n];
+    }
+
+    const chunk = new Float32Array(Ha);
+    for (let n = 0; n < Ha; n++) {
+      chunk[n] = outAccum[n] / Math.max(normAccum[n], 1e-6);
+    }
+
+    outAccum.copyWithin(0, Ha);
+    normAccum.copyWithin(0, Ha);
+    for (let n = N - Ha; n < N; n++) { outAccum[n] = 0; normAccum[n] = 0; }
+
+    timeOut.textContent = ((frameIdx * Ha) / audioBuffer.sampleRate).toFixed(2) + ' s';
+    playhead.style.left = (currentFramePos / (numFrames - 2)) * 100 + '%';
+
+    return chunk;
+  }
+
+  function startVocoder() {
+    const ctx = ensureCtx();
+    if (scriptNode) scriptNode.disconnect();
+    scriptNode = ctx.createScriptProcessor(2048, 0, 1);
+    let pending = new Float32Array(0);
+    let pendingIdx = 0;
+    scriptNode.onaudioprocess = function (e) {
+      const out = e.outputBuffer.getChannelData(0);
+      let written = 0;
+      while (written < out.length) {
+        if (pendingIdx >= pending.length) {
+          const targetFrame = targetRatio * (numFrames - 2);
+          currentFramePos += (targetFrame - currentFramePos) * inertia;
+          pending = synthesizeHop();
+          pendingIdx = 0;
+        }
+        const take = Math.min(pending.length - pendingIdx, out.length - written);
+        for (let i = 0; i < take; i++) out[written + i] = pending[pendingIdx + i];
+        written += take;
+        pendingIdx += take;
+      }
+    };
+    scriptNode.connect(ctx.destination);
+    stopBtn.disabled = false;
+    startBtn.disabled = true;
+  }
+
+  function stopVocoder() {
+    if (scriptNode) { scriptNode.disconnect(); scriptNode = null; }
+    stopBtn.disabled = true;
+    startBtn.disabled = false;
+  }
+
+  fileInput.addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    status.textContent = 'Decodificando y analizando...';
+    const ctx = ensureCtx();
+    const reader = new FileReader();
+    reader.onload = () => {
+      ctx.decodeAudioData(reader.result, (buf) => {
+        audioBuffer = buf;
+        analyze(audioBuffer);
+        drawWaveform(audioBuffer);
+        outAccum.fill(0); normAccum.fill(0); outPhase.fill(0);
+        currentFramePos = 0; targetRatio = 0;
+        playhead.style.display = 'block';
+        status.textContent = file.name + ' — ' + numFrames + ' frames analizados';
+        durOut.textContent = audioBuffer.duration.toFixed(2) + ' s';
+        startBtn.disabled = false;
+      }, () => { status.textContent = 'No se pudo decodificar este archivo'; });
+    };
+    reader.readAsArrayBuffer(file);
+  });
+
+  startBtn.addEventListener('click', startVocoder);
+  stopBtn.addEventListener('click', stopVocoder);
+
+  function ratioFromEvent(e) {
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    return Math.min(Math.max(x / rect.width, 0), 1);
+  }
+
+  let dragging = false;
+  canvas.addEventListener('pointerdown', (e) => { dragging = true; targetRatio = ratioFromEvent(e); });
+  window.addEventListener('pointerup', () => { dragging = false; });
+  canvas.addEventListener('pointermove', (e) => {
+    if (dragging) targetRatio = ratioFromEvent(e);
+  });
+
+  window.addEventListener('resize', () => { if (audioBuffer) drawWaveform(audioBuffer); });
+})();
+</script>
+</body>
+</html>

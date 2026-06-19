@@ -54,3 +54,32 @@ if (app.ports && app.ports.reproducirTono) {
     synth.triggerAttackRelease(nota, '8n');
   });
 }
+
+// Asumiendo que ya hiciste el proceso de señalización (handshake) con tu backend en Bun
+const peerConnection = new RTCPeerConnection({
+  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+});
+
+// Crear el canal de datos optimizado para LATENCIA MÍNIMA
+const dataChannel = peerConnection.createDataChannel("jamofono-audio", {
+  ordered: false,           // No bloquea si un paquete se pierde (atraviesa el Head-of-Line Blocking)
+  maxRetransmits: 0         // Modo UDP puro: si se perdió, se perdió
+});
+
+// CONEXIÓN DESDE ELM HACIA LA RED
+if (app.ports && app.ports.enviarNota) {
+  app.ports.enviarNota.subscribe((nota) => {
+    if (dataChannel.readyState === "open") {
+      // Aquí puedes empaquetar en formato OSC nativo si lo deseas usando DataView
+      dataChannel.send(nota); 
+    }
+  });
+}
+
+// CONEXIÓN DESDE LA RED HACIA ELM
+dataChannel.onmessage = (event) => {
+  if (app.ports && app.ports.notaRecibida) {
+    // Introducir la nota externa directamente al ciclo de Elm
+    app.ports.notaRecibida.send(event.data);
+  }
+};
